@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run MySQL SSH smoke test (Windows)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/test_mysql_via_ssh.py",
+      "console": "integratedTerminal",
+      "envFile": "${workspaceFolder}/.env"
+    }
+  ]
+}
