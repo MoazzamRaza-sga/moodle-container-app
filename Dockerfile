@@ -1,10 +1,10 @@
 FROM python:3.11-slim
 
-WORKDIR /app
+WORKDIR /moodleapp
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY test_mysql_via_ssh.py .
+COPY . .
 
 # non-root user (optional)
 RUN useradd -m appuser
