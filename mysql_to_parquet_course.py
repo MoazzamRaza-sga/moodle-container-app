@@ -1,4 +1,4 @@
-import os, sys, io, json, tempfile, platform, math
+import os, sys, io, json, tempfile, platform, math, ssl
 from datetime import datetime, timezone
 from contextlib import contextmanager
 
@@ -26,6 +26,13 @@ def _require(name):
 def _get(name, default=None):
     v = os.getenv(name)
     return v if v is not None and v != "" else default
+
+# NEW: resolve managed identity client id if supplied (user-assigned)
+def _default_azure_credential():
+    mi_client_id = _get("AZURE_CLIENT_ID")
+    if mi_client_id:
+        return DefaultAzureCredential(managed_identity_client_id=mi_client_id)
+    return DefaultAzureCredential()
 
 @contextmanager
 def temp_pem_from_env():
@@ -58,7 +65,8 @@ def temp_pem_from_env():
     elif pem_path:
         yield pem_path
     else:
-        raise RuntimeError("Provide SSH_PRIVATE_KEY or SSH_PRIVATE_KEY_PATH")
+        # NEW: allow password-based SSH elsewhere; return None here.
+        yield None
 
 # ---------- Storage (ADLS/local) ----------
 
@@ -82,7 +90,7 @@ class ParquetSink:
                 raise RuntimeError("For ADLS, set STORAGE_ACCOUNT and FILE_SYSTEM.")
             self.mode = "adls"
             acct_url = f"https://{self.account}.dfs.core.windows.net"
-            cred = DefaultAzureCredential(exclude_shared_token_cache_credential=True)
+            cred = _default_azure_credential()  # NEW: user-assigned MI support
             self.dls = DataLakeServiceClient(account_url=acct_url, credential=cred)
             self.fs = self.dls.get_file_system_client(self.fs_name)
             print(f"[sink] Using ADLS: {acct_url}/{self.fs_name}")
@@ -147,9 +155,13 @@ class ParquetSink:
         file.upload_data(payload, overwrite=True)
         print(f"[sink] wrote marker → abfss://{self.fs_name}@{self.account}.dfs.core.windows.net/{rel}")
 
-# ---------- MySQL over SSH ----------
+# ---------- MySQL (SSH or DIRECT) ----------
 
-def make_ssh_tunnel():
+def make_ssh_tunnel_if_needed():
+    connect_via = _get("CONNECT_VIA", "SSH").upper()
+    if connect_via != "SSH":
+        return None, None
+
     ssh_host = _require("SSH_HOST")
     ssh_port = int(_get("SSH_PORT", "22"))
     ssh_user = _require("SSH_USERNAME")
@@ -157,27 +169,59 @@ def make_ssh_tunnel():
     db_host = _get("DB_HOST", "127.0.0.1")
     db_port = int(_get("DB_PORT", "3306"))
 
-    key_path_ctx = temp_pem_from_env()
+    ssh_password = _get("SSH_PASSWORD")
+    key_ctx = temp_pem_from_env()
+    key_path = key_ctx.__enter__()  # may be None if using password
 
-    key_path = key_path_ctx.__enter__()  # manual so we can close later
-    tunnel = SSHTunnelForwarder(
-        (ssh_host, ssh_port),
-        ssh_username=ssh_user,
-        ssh_pkey=key_path,
-        remote_bind_address=(db_host, db_port),
-    )
+    kwargs = {
+        "ssh_address_or_host": (ssh_host, ssh_port),
+        "ssh_username": ssh_user,
+        "remote_bind_address": (db_host, db_port),
+    }
+    if ssh_password and not key_path:
+        kwargs["ssh_password"] = ssh_password
+    else:
+        if not key_path:
+            raise RuntimeError("Provide SSH_PRIVATE_KEY/SSH_PRIVATE_KEY_PATH or SSH_PASSWORD")
+        kwargs["ssh_pkey"] = key_path
+
+    tunnel = SSHTunnelForwarder(**kwargs)
     tunnel.start()
     print(f"[ssh] tunnel on localhost:{tunnel.local_bind_port}")
-    return tunnel, key_path_ctx
+    return tunnel, key_ctx
+
+def mysql_ssl_kwargs():
+    """Build TLS settings for PyMySQL based on env."""
+    mode = (_get("DB_SSL_MODE") or "").lower()
+    ca_path = _get("DB_SSL_CA_PATH", "/etc/ssl/certs/ca-certificates.crt")
+
+    if mode == "disabled":
+        return {}
+
+    # If verify_ca, provide CA path; if required (no verify), empty dict enables TLS.
+    if mode == "verify_ca":
+        return {"ssl": {"ca": ca_path}}
+    # default to 'required' (TLS without explicit CA)
+    return {"ssl": {}}
 
 def mysql_connect(tunnel):
     db_name = _require("DB_NAME")
     db_user = _require("DB_USERNAME")
     db_pass = _require("DB_PASSWORD")
 
+    connect_via = _get("CONNECT_VIA", "SSH").upper()
+    if tunnel and connect_via == "SSH":
+        host = "127.0.0.1"
+        port = tunnel.local_bind_port
+        ssl_kwargs = {}  # tunnel is already encrypted
+    else:
+        host = _require("DB_HOST")
+        port = int(_get("DB_PORT", "3306"))
+        ssl_kwargs = mysql_ssl_kwargs()
+
     conn = pymysql.connect(
-        host="127.0.0.1",
-        port=tunnel.local_bind_port,
+        host=host,
+        port=port,
         user=db_user,
         password=db_pass,
         database=db_name,
@@ -187,6 +231,7 @@ def mysql_connect(tunnel):
         write_timeout=120,
         charset=_get("DB_CHARSET", "utf8mb4"),
         autocommit=False,
+        **ssl_kwargs
     )
     return conn
 
@@ -286,7 +331,8 @@ def run_job():
 
     print(json.dumps({
         "table": table, "pk_col": pk_col, "watermark_col": watermark_col,
-        "last_watermark": last_watermark, "chunk_size": chunk_size, "max_rows": max_rows
+        "last_watermark": last_watermark, "chunk_size": chunk_size, "max_rows": max_rows,
+        "connect_via": _get("CONNECT_VIA", "SSH").upper()
     }, indent=2))
 
     sink = ParquetSink()
@@ -298,7 +344,7 @@ def run_job():
     started = datetime.utcnow()
 
     try:
-        tunnel, key_ctx = make_ssh_tunnel()
+        tunnel, key_ctx = make_ssh_tunnel_if_needed()
         conn = mysql_connect(tunnel)
 
         # Choose strategy

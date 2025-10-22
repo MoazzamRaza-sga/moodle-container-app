@@ -10,4 +10,4 @@ COPY test_mysql_via_ssh.py .
 RUN useradd -m appuser
 USER appuser
 
-ENTRYPOINT ["python", "-u", "test_mysql_via_ssh.py"]
+ENTRYPOINT ["python", "-u", "mysql_to_parquet_course.py"]
