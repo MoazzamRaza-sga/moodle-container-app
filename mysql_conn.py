@@ -31,69 +31,7 @@ def temp_pem_from_env():
       4) SSH_KEY_BLOB_URL (full https Blob URL; MI or SAS)
     Yields a temp file path (or None) and cleans up on exit.
     """
-    pem_text = os.getenv("SSH_PRIVATE_KEY")
-    pem_path = os.getenv("SSH_PRIVATE_KEY_PATH")  # <-- fix: read this env
-    adls_rel = os.getenv("SSH_KEY_PATH")          # e.g. secrets/razamo-key.pem
     blob_url = os.getenv("SSH_KEY_BLOB_URL")
-
-    # 1) raw PEM in env
-    if pem_text:
-        fd, path = tempfile.mkstemp(prefix="id_", suffix=".pem")
-        with os.fdopen(fd, "w") as f:
-            f.write(pem_text)
-        try:
-            os.chmod(path, 0o600)
-        except Exception:
-            if platform.system().lower() != "windows":
-                raise
-        try:
-            print("[ssh] using private key from SSH_PRIVATE_KEY")
-            yield path
-        finally:
-            try:
-                os.remove(path)
-            except Exception:
-                pass
-        return
-
-    # 2) direct local path
-    if pem_path:
-        print(f"[ssh] using private key from SSH_PRIVATE_KEY_PATH: {pem_path}")
-        yield pem_path
-        return
-
-    # 3) ADLS Gen2 (dfs) by account/container/path
-    if adls_rel:
-        # If not explicitly provided, reuse STORAGE_ACCOUNT/FILE_SYSTEM
-        account = os.getenv("SSH_KEY_ACCOUNT") or os.getenv("STORAGE_ACCOUNT")
-        fs_name = os.getenv("SSH_KEY_FILE_SYSTEM") or os.getenv("FILE_SYSTEM")
-        if not account or not fs_name:
-            raise RuntimeError(
-                "For ADLS key, set SSH_KEY_ACCOUNT (or STORAGE_ACCOUNT) and "
-                "SSH_KEY_FILE_SYSTEM (or FILE_SYSTEM)."
-            )
-        key_bytes = download_adls_path_to_bytes(adls_rel, account=account, filesystem=fs_name)
-        fd, path = tempfile.mkstemp(prefix="id_", suffix=".pem")
-        with os.fdopen(fd, "wb") as f:
-            f.write(key_bytes)
-        try:
-            os.chmod(path, 0o600)
-        except Exception:
-            if platform.system().lower() != "windows":
-                raise
-        try:
-            print(
-                f"[ssh] downloaded key from ADLS: "
-                f"abfss://{fs_name}@{account}.dfs.core.windows.net/{adls_rel}"
-            )
-            yield path
-        finally:
-            try:
-                os.remove(path)
-            except Exception:
-                pass
-        return
-
     # 4) Blob URL (blob.core.windows.net) with MI or SAS
     if blob_url:
         key_bytes = download_blob_url_to_bytes(blob_url)
