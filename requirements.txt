@@ -3,6 +3,6 @@ sshtunnel==0.4.0
 paramiko==2.12.0
 PyMySQL==1.1.1
 azure-identity==1.17.1
+azure-storage-blob>=12.21.0
 azure-storage-file-datalake==12.16.0
-azure-storage-blob==12.16.0
 pyarrow==17.0.0
