@@ -1,6 +1,7 @@
 import os
 import json
 import tempfile
+import time
 from datetime import datetime
 from typing import Optional, Dict, Any
 
@@ -12,6 +13,7 @@ from azure.identity import DefaultAzureCredential
 from azure.storage.filedatalake import DataLakeServiceClient
 from azure.storage.blob import BlobServiceClient, BlobClient
 from azure.core.exceptions import ResourceNotFoundError
+from azure.core.pipeline.policies import RetryPolicy
 
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
@@ -38,30 +40,6 @@ def _default_azure_credential():
     return DefaultAzureCredential()
 
 
-# -------------------- Low-level storage helpers --------------------
-
-def _get_adls_clients(account: str, filesystem: str):
-    cred = _default_azure_credential()
-    acct_url = f"https://{account}.dfs.core.windows.net"
-    dls = DataLakeServiceClient(account_url=acct_url, credential=cred)
-    fs = dls.get_file_system_client(filesystem)
-    return dls, fs
-
-def download_adls_path_to_bytes(rel_path: str,
-                                account: Optional[str] = None,
-                                filesystem: Optional[str] = None) -> bytes:
-    account = account or _require("STORAGE_ACCOUNT")
-    filesystem = filesystem or _require("FILE_SYSTEM")
-    _, fs = _get_adls_clients(account, filesystem)
-    file_client = fs.get_file_client(rel_path)
-    return file_client.download_file().readall()
-
-def download_blob_url_to_bytes(blob_url: str) -> bytes:
-    cred = _default_azure_credential()
-    bc = BlobClient.from_blob_url(blob_url, credential=cred)
-    return bc.download_blob().readall()
-
-
 # -------------------- CSV sink (single file per table per run) --------------------
 
 class CSVSink:
@@ -74,9 +52,8 @@ class CSVSink:
     Success JSON:
       OUTPUT_BASE_PATH/json logs/<table>/<YYYY>/<MM>/<DD>/success.json
 
-    Implementation detail:
-      - LOCAL mode: append directly to the final file path
-      - ADLS/Blob modes: append to a local temp file per table, then upload once on success
+    LOCAL mode: append directly to final file.
+    ADLS/Blob modes: buffer to a local temp file, then upload once per table.
     """
 
     def __init__(self):
@@ -87,8 +64,12 @@ class CSVSink:
         self.container = _get("FILE_SYSTEM")  # ADLS filesystem or Blob container
         self.storage_kind = _get("STORAGE_KIND", "adls").lower()  # 'adls' or 'blob'
 
-        # Dynamic date (YYYY/MM/DD) in OUTPUT_TZ
-        now = datetime.utcnow()
+        # Dynamic date (YYYY/MM/DD) in OUTPUT_TZ (fallback UTC)
+        tz_name = _get("OUTPUT_TZ", "Asia/Karachi")
+        if ZoneInfo:
+            now = datetime.now(ZoneInfo(tz_name))
+        else:
+            now = datetime.utcnow()
         self.y = f"{now.year:04d}"
         self.m = f"{now.month:02d}"
         self.d = f"{now.day:02d}"
@@ -96,6 +77,18 @@ class CSVSink:
         # For success marker payload
         self.run_ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         self.ingestion_date = datetime.utcnow().strftime("%Y-%m-%d")
+
+        # Optional cleanup of sibling CSVs (e.g., table_01.csv created previously)
+        self.cleanup_siblings = (_get("CLEANUP_SIBLINGS", "false").lower() == "true")
+
+        # Azure retry policy (gentle exponential backoff)
+        retry_total = int(_get("AZURE_RETRIES", "7"))
+        backoff = float(_get("AZURE_RETRY_BACKOFF", "0.8"))
+        self._retry_policy = RetryPolicy(
+            retry_total=retry_total,
+            retry_mode="exponential",
+            retry_backoff_factor=backoff,  # seconds
+        )
 
         # Init backends
         if self.local_out:
@@ -109,13 +102,17 @@ class CSVSink:
             if self.storage_kind == "adls":
                 self.mode = "adls"
                 acct_url = f"https://{self.account}.dfs.core.windows.net"
-                self.dls = DataLakeServiceClient(account_url=acct_url, credential=cred)
+                self.dls = DataLakeServiceClient(
+                    account_url=acct_url, credential=cred, retry_policy=self._retry_policy
+                )
                 self.fs = self.dls.get_file_system_client(self.container)
                 print(f"[sink] Using ADLS (dfs): {acct_url}/{self.container}")
             elif self.storage_kind == "blob":
                 self.mode = "blob"
                 acct_url = f"https://{self.account}.blob.core.windows.net"
-                self.bsc = BlobServiceClient(account_url=acct_url, credential=cred)
+                self.bsc = BlobServiceClient(
+                    account_url=acct_url, credential=cred, retry_policy=self._retry_policy
+                )
                 self.cc = self.bsc.get_container_client(self.container)
                 print(f"[sink] Using Blob (blob): {acct_url}/{self.container}")
             else:
@@ -135,8 +132,42 @@ class CSVSink:
         return f"{self._data_dir_for(table)}/{table}.csv"
 
     def _success_relpath_for(self, table: str) -> str:
-        # note: the folder name must literally be "json logs" (with space)
+        # folder name is literally "json logs"
         return f"{self.base_path}/json logs/{table}/{self.y}/{self.m}/{self.d}/success.json"
+
+    # ---------- Cleanup helpers ----------
+    def _delete_remote(self, rel: str):
+        try:
+            if self.mode == "adls":
+                self.fs.delete_file(rel)
+            elif self.mode == "blob":
+                self.cc.delete_blob(rel, delete_snapshots="include")
+        except Exception:
+            pass  # ok if it doesn't exist
+
+    def _cleanup_previous_csvs(self, table: str, final_rel: str):
+        if not self.cleanup_siblings:
+            return
+        prefix = f"{self._data_dir_for(table)}/"
+        try:
+            if self.mode == "adls":
+                for p in self.fs.get_paths(path=prefix, recursive=False):
+                    name = p.name
+                    if name.endswith(".csv") and name != final_rel:
+                        try:
+                            self.fs.delete_file(name)
+                        except Exception:
+                            pass
+            elif self.mode == "blob":
+                for b in self.cc.list_blobs(name_starts_with=prefix):
+                    name = b.name
+                    if name.endswith(".csv") and name != final_rel:
+                        try:
+                            self.cc.delete_blob(name, delete_snapshots="include")
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
     # ---------- File lifecycle per table ----------
     def _prepare_table(self, table: str):
@@ -150,9 +181,8 @@ class CSVSink:
             # Create parent dirs and open final file for append
             path = os.path.join(self.local_out, rel.replace("/", os.sep))
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            # fresh file each run
             if os.path.exists(path):
-                os.remove(path)
+                os.remove(path)  # fresh file each run
             self._state[table] = {
                 "header_written": False,
                 "rel": rel,
@@ -162,7 +192,7 @@ class CSVSink:
             print(f"[sink] Writing → {path}")
             return
 
-        # Cloud modes: write to a temporary local file first
+        # Cloud modes: buffer to a temporary local file first
         fd, tmp = tempfile.mkstemp(prefix=f"{table}_", suffix=".csv")
         os.close(fd)  # we'll open/append normally later
         self._state[table] = {
@@ -175,7 +205,6 @@ class CSVSink:
 
     # ---------- Append a chunk ----------
     def write_table(self, table_pa: pa.Table, part_idx: int, dataset_name: str) -> str:
-        """External signature retained; dataset_name is the table name."""
         tbl = dataset_name
         self._prepare_table(tbl)
 
@@ -208,16 +237,24 @@ class CSVSink:
         if st and self.mode in ("adls", "blob") and st["temp_path"]:
             tmp = st["temp_path"]
             rel = st["rel"]
+
+            # ensure no stale file or siblings
+            self._cleanup_previous_csvs(dataset_name, rel)
+            self._delete_remote(rel)
+
             if self.mode == "adls":
                 fc = self.fs.get_file_client(rel)
                 with open(tmp, "rb") as f:
-                    fc.upload_data(f, overwrite=True)
+                    # avoid parallelism to reduce throttling
+                    fc.upload_data(f, overwrite=True, max_concurrency=1)
                 print(f"[sink] uploaded → abfss://{self.container}@{self.account}.dfs.core.windows.net/{rel}")
             else:
                 bc = self.cc.get_blob_client(rel)
                 with open(tmp, "rb") as f:
-                    bc.upload_blob(f, overwrite=True)
+                    # avoid parallelism to reduce throttling
+                    bc.upload_blob(f, overwrite=True, max_concurrency=1)
                 print(f"[sink] uploaded → https://{self.account}.blob.core.windows.net/{self.container}/{rel}")
+
             # cleanup temp
             try:
                 os.remove(tmp)
@@ -249,12 +286,12 @@ class CSVSink:
 
         if self.mode == "adls":
             fc = self.fs.get_file_client(rel_success)
-            fc.upload_data(payload, overwrite=True)
+            fc.upload_data(payload, overwrite=True, max_concurrency=1)
             print(f"[sink] wrote success → abfss://{self.container}@{self.account}.dfs.core.windows.net/{rel_success}")
             return
 
         bc = self.cc.get_blob_client(rel_success)
-        bc.upload_blob(payload, overwrite=True)
+        bc.upload_blob(payload, overwrite=True, max_concurrency=1)
         print(f"[sink] wrote success → https://{self.account}.blob.core.windows.net/{self.container}/{rel_success}")
 
 
@@ -263,7 +300,7 @@ class CSVSink:
 class WatermarkRegistry:
     """
     Persists per-table watermark JSON at WATERMARK_DIR/<table>.json
-    (Set WATERMARK_DIR to e.g. `${OUTPUT_BASE_PATH}/json logs/watermarks` if desired.)
+    (You can set WATERMARK_DIR to e.g. `${OUTPUT_BASE_PATH}/json logs/watermarks`.)
     """
     def __init__(self):
         self.local_out = _get("LOCAL_OUTPUT_DIR")
@@ -281,15 +318,23 @@ class WatermarkRegistry:
             raise RuntimeError("For cloud registry, set STORAGE_ACCOUNT and FILE_SYSTEM (container).")
 
         cred = _default_azure_credential()
+        retry_total = int(_get("AZURE_RETRIES", "7"))
+        backoff = float(_get("AZURE_RETRY_BACKOFF", "0.8"))
+        retry_policy = RetryPolicy(
+            retry_total=retry_total,
+            retry_mode="exponential",
+            retry_backoff_factor=backoff,
+        )
+
         if self.storage_kind == "adls":
             self.mode = "adls"
             acct_url = f"https://{self.account}.dfs.core.windows.net"
-            self.dls = DataLakeServiceClient(account_url=acct_url, credential=cred)
+            self.dls = DataLakeServiceClient(account_url=acct_url, credential=cred, retry_policy=retry_policy)
             self.fs = self.dls.get_file_system_client(self.container)
         elif self.storage_kind == "blob":
             self.mode = "blob"
             acct_url = f"https://{self.account}.blob.core.windows.net"
-            self.bsc = BlobServiceClient(account_url=acct_url, credential=cred)
+            self.bsc = BlobServiceClient(account_url=acct_url, credential=cred, retry_policy=retry_policy)
             self.cc = self.bsc.get_container_client(self.container)
         else:
             raise RuntimeError("STORAGE_KIND must be 'adls' or 'blob'.")
@@ -343,11 +388,11 @@ class WatermarkRegistry:
 
         if self.mode == "adls":
             file = self.fs.get_file_client(rel)
-            file.upload_data(data, overwrite=True)
+            file.upload_data(data, overwrite=True, max_concurrency=1)
             print(f"[wm] saved → abfss://{self.container}@{self.account}.dfs.core.windows.net/{rel}")
             return
 
         # blob
         bc = self.cc.get_blob_client(rel)
-        bc.upload_blob(data, overwrite=True)
+        bc.upload_blob(data, overwrite=True, max_concurrency=1)
         print(f"[wm] saved → https://{self.account}.blob.core.windows.net/{self.container}/{rel}")

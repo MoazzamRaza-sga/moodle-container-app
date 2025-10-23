@@ -1,5 +1,6 @@
 import json
 import sys
+import time
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -16,7 +17,7 @@ from mysql_conn import (
 TABLE_SPECS = [
     {"name": "mdl_cohort",                          "pk": "id", "wm": "timemodified"},
     {"name": "mdl_cohort_members",                  "pk": "id", "wm": "timeadded"},
-    {"name": "mdl_context",                         "pk": "id", "wm": None},                 # PK-based incremental
+    {"name": "mdl_context",                         "pk": "id", "wm": None},
     {"name": "mdl_course",                          "pk": "id", "wm": "timemodified"},
     {"name": "mdl_course_categories",               "pk": "id", "wm": "timemodified"},
     {"name": "mdl_course_completion_crit_compl",    "pk": "id", "wm": "timecompleted"},
@@ -56,9 +57,10 @@ def _max_col(batch, col):
 def run_job() -> int:
     load_dotenv()
 
-    chunk_size = int(_get("CHUNK_SIZE", "200000"))
+    chunk_size = int(_get("CHUNK_SIZE", "20000"))
     max_rows = _get("MAX_ROWS")
     max_rows = int(max_rows) if max_rows else None
+    per_table_pause = float(_get("PER_TABLE_PAUSE_SEC", "0"))  # gentle throttle across tables
 
     print(json.dumps({
         "connect_via": _get("CONNECT_VIA", "SSH").upper(),
@@ -114,7 +116,6 @@ def run_job() -> int:
                 if tbl is None or tbl.num_rows == 0:
                     continue
 
-                # compute batch max for chosen watermark column (or pk)
                 col_for_wm = (wm_col or pk_col)
                 batch_max = _max_col(rows, col_for_wm)
                 if batch_max is not None:
@@ -132,9 +133,11 @@ def run_job() -> int:
             )
             print(f"[{name}] done total_rows={total_rows}, parts={parts}, duration_s={duration_s:.2f}")
 
-            # save watermark only if we actually processed data
             if parts > 0 and max_seen is not None:
                 registry.save(name, column=(wm_col or pk_col), value=max_seen)
+
+            if per_table_pause > 0:
+                time.sleep(per_table_pause)
 
         return 0
 
