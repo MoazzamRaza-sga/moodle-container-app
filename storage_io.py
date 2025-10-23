@@ -217,11 +217,11 @@ class CSVSink:
         tbl = dataset_name
         self._prepare_table(tbl)
 
-        include_header = not self._state[tbl]["header_written"]
-        write_opts = pacsv.WriteOptions(include_header=include_header)
+        # include_header = not self._state[tbl]["header_written"]
+        # write_opts = pacsv.WriteOptions(include_header=include_header)
 
         buf = pa.BufferOutputStream()
-        pacsv.write_csv(table_pa, buf, options=write_opts)
+        pacsv.write_csv(table_pa, buf)
         chunk_bytes = buf.getvalue().to_pybytes()
 
         self._state[tbl]["header_written"] = True
