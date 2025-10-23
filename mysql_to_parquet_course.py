@@ -45,7 +45,7 @@ def temp_pem_from_env():
     Yields a temp file path and cleans up on exit.
     """
     pem_text = os.getenv("SSH_PRIVATE_KEY")
-    pem_path = os.getenv("SSH_PRIVATE_KEY_PATH")
+    pem_path = None
     adls_rel = os.getenv("SSH_KEY_PATH")  # e.g. secrets/razamo-key.pem
     blob_url = os.getenv("SSH_KEY_BLOB_URL")
 
@@ -99,6 +99,7 @@ def temp_pem_from_env():
 
     # 4) Blob URL (blob.core.windows.net) with MI or SAS
     if blob_url:
+        print("blob url .pem file")
         # If SAS is embedded, credential can be omitted; MI works when no SAS is present.
         bc = BlobClient.from_blob_url(blob_url, credential=cred)
         key_bytes = bc.download_blob().readall()
