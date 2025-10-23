@@ -1,5 +1,7 @@
+# ... keep the other imports as before ...
 import os
 import json
+import tempfile
 from datetime import datetime
 from typing import Optional, Dict, Any
 
@@ -9,7 +11,7 @@ import pyarrow.csv as pacsv  # CSV writer
 # Azure SDKs
 from azure.identity import DefaultAzureCredential
 from azure.storage.filedatalake import DataLakeServiceClient
-from azure.storage.blob import BlobServiceClient, BlobClient, AppendBlobClient
+from azure.storage.blob import BlobServiceClient, BlobClient
 from azure.core.exceptions import ResourceNotFoundError
 
 try:
@@ -17,51 +19,8 @@ try:
 except Exception:  # pragma: no cover
     ZoneInfo = None
 
+# ... keep _require, _get, _default_azure_credential, download helpers, etc. ...
 
-# -------------------- Env helpers --------------------
-
-def _require(name: str) -> str:
-    v = os.getenv(name)
-    if not v:
-        raise RuntimeError(f"Missing required env: {name}")
-    return v
-
-def _get(name: str, default: Optional[str] = None) -> Optional[str]:
-    v = os.getenv(name)
-    return v if v is not None and v != "" else default
-
-def _default_azure_credential():
-    mi_client_id = _get("AZURE_CLIENT_ID")
-    if mi_client_id:
-        return DefaultAzureCredential(managed_identity_client_id=mi_client_id)
-    return DefaultAzureCredential()
-
-
-# -------------------- Low-level storage helpers --------------------
-
-def _get_adls_clients(account: str, filesystem: str):
-    cred = _default_azure_credential()
-    acct_url = f"https://{account}.dfs.core.windows.net"
-    dls = DataLakeServiceClient(account_url=acct_url, credential=cred)
-    fs = dls.get_file_system_client(filesystem)
-    return dls, fs
-
-def download_adls_path_to_bytes(rel_path: str,
-                                account: Optional[str] = None,
-                                filesystem: Optional[str] = None) -> bytes:
-    account = account or _require("STORAGE_ACCOUNT")
-    filesystem = filesystem or _require("FILE_SYSTEM")
-    _, fs = _get_adls_clients(account, filesystem)
-    file_client = fs.get_file_client(rel_path)
-    return file_client.download_file().readall()
-
-def download_blob_url_to_bytes(blob_url: str) -> bytes:
-    cred = _default_azure_credential()
-    bc = BlobClient.from_blob_url(blob_url, credential=cred)
-    return bc.download_blob().readall()
-
-
-# -------------------- CSV sink (single file per table per run) --------------------
 
 class CSVSink:
     """
@@ -73,11 +32,12 @@ class CSVSink:
     Success JSON:
       OUTPUT_BASE_PATH/json logs/<table>/<YYYY>/<MM>/<DD>/success.json
 
-    Supports local, ADLS Gen2 (dfs), and Blob (append blob).
+    Implementation detail:
+      - LOCAL mode: append directly to the final file path
+      - ADLS/Blob modes: append to a local temp file per table, then upload once on success
     """
 
     def __init__(self):
-        # Required base path for final layout
         self.base_path = _require("OUTPUT_BASE_PATH").strip().strip("/")
 
         self.local_out = _get("LOCAL_OUTPUT_DIR")
@@ -123,7 +83,10 @@ class CSVSink:
             else:
                 raise RuntimeError("STORAGE_KIND must be 'adls' or 'blob'.")
 
-        # per-table state: { table: { "header_written": bool, "offset": int, "rel": str, "success_rel": str, ... } }
+        # per-table state:
+        # { table: { "header_written": bool,
+        #            "rel": str, "success_rel": str,
+        #            "temp_path": str or None } }
         self._state: Dict[str, Dict[str, Any]] = {}
 
     # ---------- Path helpers ----------
@@ -138,107 +101,93 @@ class CSVSink:
         return f"{self.base_path}/json logs/{table}/{self.y}/{self.m}/{self.d}/success.json"
 
     # ---------- File lifecycle per table ----------
-    def _delete_if_exists(self, rel: str):
-        try:
-            if self.mode == "local":
-                path = os.path.join(self.local_out, rel.replace("/", os.sep))
-                if os.path.exists(path):
-                    os.remove(path)
-                return
-            if self.mode == "adls":
-                fc = self.fs.get_file_client(rel)
-                fc.delete_file()
-                return
-            # blob
-            bc = self.cc.get_blob_client(rel)
-            bc.delete_blob(delete_snapshots="include")
-        except ResourceNotFoundError:
-            pass
-        except FileNotFoundError:
-            pass
-
     def _prepare_table(self, table: str):
         if table in self._state:
-            return  # already prepared
+            return
 
         rel = self._data_relpath_for(table)
         success_rel = self._success_relpath_for(table)
-        self._delete_if_exists(rel)
 
         if self.mode == "local":
-            # Create parent dirs and empty file
+            # Create parent dirs and open final file for append
             path = os.path.join(self.local_out, rel.replace("/", os.sep))
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            open(path, "wb").close()
-            self._state[table] = {"header_written": False, "offset": 0, "rel": rel, "success_rel": success_rel}
+            # fresh file each run
+            if os.path.exists(path):
+                os.remove(path)
+            self._state[table] = {
+                "header_written": False,
+                "rel": rel,
+                "success_rel": success_rel,
+                "temp_path": None,   # not needed in local mode
+            }
             print(f"[sink] Writing → {path}")
             return
 
-        if self.mode == "adls":
-            fc = self.fs.get_file_client(rel)
-            fc.create_file()  # create empty file
-            self._state[table] = {"header_written": False, "offset": 0, "rel": rel, "success_rel": success_rel, "fc": fc}
-            print(f"[sink] Writing → abfss://{self.container}@{self.account}.dfs.core.windows.net/{rel}")
-            return
-
-        # blob (Append Blob)
-        abc = AppendBlobClient(account_url=f"https://{self.account}.blob.core.windows.net",
-                               container_name=self.container,
-                               blob_name=rel,
-                               credential=_default_azure_credential())
-        try:
-            abc.create_append_blob()
-        except Exception:
-            # If it already exists and couldn't be deleted, try delete+recreate
-            try:
-                abc.delete_blob(delete_snapshots="include")
-                abc.create_append_blob()
-            except Exception:
-                pass
-        self._state[table] = {"header_written": False, "offset": 0, "rel": rel, "success_rel": success_rel, "abc": abc}
-        print(f"[sink] Writing → https://{self.account}.blob.core.windows.net/{self.container}/{rel}")
+        # Cloud modes: write to a temporary local file first
+        fd, tmp = tempfile.mkstemp(prefix=f"{table}_", suffix=".csv")
+        os.close(fd)  # we'll open/append normally later
+        self._state[table] = {
+            "header_written": False,
+            "rel": rel,
+            "success_rel": success_rel,
+            "temp_path": tmp,
+        }
+        print(f"[sink] Buffering → {tmp}  (final: {rel})")
 
     # ---------- Append a chunk ----------
     def write_table(self, table_pa: pa.Table, part_idx: int, dataset_name: str) -> str:
-        """Keep external signature; dataset_name is the MySQL table name."""
+        """External signature retained; dataset_name is the table name."""
         tbl = dataset_name
         self._prepare_table(tbl)
 
-        # header on first chunk only
         include_header = not self._state[tbl]["header_written"]
         write_opts = pacsv.WriteOptions(include_header=include_header)
 
         buf = pa.BufferOutputStream()
         pacsv.write_csv(table_pa, buf, options=write_opts)
-        data = buf.getvalue().to_pybytes()
+        chunk_bytes = buf.getvalue().to_pybytes()
 
-        # Update state
         self._state[tbl]["header_written"] = True
-
         rel = self._state[tbl]["rel"]
 
         if self.mode == "local":
             path = os.path.join(self.local_out, rel.replace("/", os.sep))
             with open(path, "ab") as f:
-                f.write(data)
+                f.write(chunk_bytes)
             return rel
 
-        if self.mode == "adls":
-            fc = self._state[tbl]["fc"]
-            offset = self._state[tbl]["offset"]
-            fc.append_data(data=data, offset=offset, length=len(data))
-            fc.flush_data(offset + len(data))
-            self._state[tbl]["offset"] = offset + len(data)
-            return rel
-
-        # blob append
-        abc: AppendBlobClient = self._state[tbl]["abc"]
-        abc.append_block(data)
+        # Cloud modes: append to temp file
+        tmp = self._state[tbl]["temp_path"]
+        with open(tmp, "ab") as f:
+            f.write(chunk_bytes)
         return rel
 
-    # ---------- Success marker ----------
+    # ---------- Upload temp file (cloud) + success marker ----------
     def write_success_marker(self, total_rows: int, parts: int, extras: dict, dataset_name: str):
-        rel = self._success_relpath_for(dataset_name)
+        # If cloud: upload temp file to final destination first
+        st = self._state.get(dataset_name)
+        if st and self.mode in ("adls", "blob") and st["temp_path"]:
+            tmp = st["temp_path"]
+            rel = st["rel"]
+            if self.mode == "adls":
+                fc = self.fs.get_file_client(rel)
+                with open(tmp, "rb") as f:
+                    fc.upload_data(f, overwrite=True)
+                print(f"[sink] uploaded → abfss://{self.container}@{self.account}.dfs.core.windows.net/{rel}")
+            else:
+                bc = self.cc.get_blob_client(rel)
+                with open(tmp, "rb") as f:
+                    bc.upload_blob(f, overwrite=True)
+                print(f"[sink] uploaded → https://{self.account}.blob.core.windows.net/{self.container}/{rel}")
+            # cleanup temp
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
+        # Now write the success marker
+        rel_success = self._success_relpath_for(dataset_name)
         marker = {
             "dataset": dataset_name,
             "total_rows": total_rows,
@@ -253,7 +202,7 @@ class CSVSink:
         payload = (json.dumps(marker, indent=2) + "\n").encode("utf-8")
 
         if self.mode == "local":
-            path = os.path.join(self.local_out, rel.replace("/", os.sep))
+            path = os.path.join(self.local_out, rel_success.replace("/", os.sep))
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "wb") as f:
                 f.write(payload)
@@ -261,108 +210,11 @@ class CSVSink:
             return
 
         if self.mode == "adls":
-            fc = self.fs.get_file_client(rel)
-            # ensure parent path exists implicitly; upload will create
+            fc = self.fs.get_file_client(rel_success)
             fc.upload_data(payload, overwrite=True)
-            print(f"[sink] wrote success → abfss://{self.container}@{self.account}.dfs.core.windows.net/{rel}")
+            print(f"[sink] wrote success → abfss://{self.container}@{self.account}.dfs.core.windows.net/{rel_success}")
             return
 
-        # blob
-        bc = self.cc.get_blob_client(rel)
+        bc = self.cc.get_blob_client(rel_success)
         bc.upload_blob(payload, overwrite=True)
-        print(f"[sink] wrote success → https://{self.account}.blob.core.windows.net/{self.container}/{rel}")
-
-
-# -------------------- Watermark registry (unchanged behavior) --------------------
-
-class WatermarkRegistry:
-    """
-    Persists per-table watermark JSON at WATERMARK_DIR/<table>.json
-    You can point WATERMARK_DIR anywhere (e.g., under OUTPUT_BASE_PATH) if you want.
-    """
-    def __init__(self):
-        self.local_out = _get("LOCAL_OUTPUT_DIR")
-        self.account = _get("STORAGE_ACCOUNT")
-        self.container = _get("FILE_SYSTEM")
-        self.storage_kind = _get("STORAGE_KIND", "adls").lower()
-        self.dir = (_get("WATERMARK_DIR", "watermarks")).strip().strip("/")
-
-        if self.local_out:
-            self.mode = "local"
-            os.makedirs(os.path.join(self.local_out, self.dir.replace("/", os.sep)), exist_ok=True)
-            return
-
-        if not self.account or not self.container:
-            raise RuntimeError("For cloud registry, set STORAGE_ACCOUNT and FILE_SYSTEM (container).")
-
-        cred = _default_azure_credential()
-        if self.storage_kind == "adls":
-            self.mode = "adls"
-            acct_url = f"https://{self.account}.dfs.core.windows.net"
-            self.dls = DataLakeServiceClient(account_url=acct_url, credential=cred)
-            self.fs = self.dls.get_file_system_client(self.container)
-        elif self.storage_kind == "blob":
-            self.mode = "blob"
-            acct_url = f"https://{self.account}.blob.core.windows.net"
-            self.bsc = BlobServiceClient(account_url=acct_url, credential=cred)
-            self.cc = self.bsc.get_container_client(self.container)
-        else:
-            raise RuntimeError("STORAGE_KIND must be 'adls' or 'blob'.")
-
-    def _rel(self, table: str) -> str:
-        return f"{self.dir}/{table}.json"
-
-    def load(self, table: str) -> Optional[Dict[str, Any]]:
-        rel = self._rel(table)
-
-        try:
-            if self.mode == "local":
-                path = os.path.join(self.local_out, rel.replace("/", os.sep))
-                if not os.path.exists(path):
-                    return None
-                with open(path, "rb") as f:
-                    return json.loads(f.read().decode("utf-8"))
-
-            if self.mode == "adls":
-                file = self.fs.get_file_client(rel)
-                data = file.download_file().readall()
-                return json.loads(data.decode("utf-8"))
-
-            # blob
-            bc = self.cc.get_blob_client(rel)
-            data = bc.download_blob().readall()
-            return json.loads(data.decode("utf-8"))
-
-        except ResourceNotFoundError:
-            return None
-        except FileNotFoundError:
-            return None
-
-    def save(self, table: str, column: str, value: Any):
-        rel = self._rel(table)
-        payload = {
-            "table": table,
-            "column": column,
-            "value": value,
-            "updated_utc": datetime.utcnow().isoformat() + "Z",
-        }
-        data = (json.dumps(payload, indent=2) + "\n").encode("utf-8")
-
-        if self.mode == "local":
-            path = os.path.join(self.local_out, rel.replace("/", os.sep))
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "wb") as f:
-                f.write(data)
-            print(f"[wm] saved → {path}")
-            return
-
-        if self.mode == "adls":
-            file = self.fs.get_file_client(rel)
-            file.upload_data(data, overwrite=True)
-            print(f"[wm] saved → abfss://{self.container}@{self.account}.dfs.core.windows.net/{rel}")
-            return
-
-        # blob
-        bc = self.cc.get_blob_client(rel)
-        bc.upload_blob(data, overwrite=True)
-        print(f"[wm] saved → https://{self.account}.blob.core.windows.net/{self.container}/{rel}")
+        print(f"[sink] wrote success → https://{self.account}.blob.core.windows.net/{self.container}/{rel_success}")
