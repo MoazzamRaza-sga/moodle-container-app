@@ -5,7 +5,7 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 
-from storage_io import CSVSink, WatermarkRegistry, _get
+from storage_io import CSVSink, run_registry, _get
 from mysql_conn import (
     make_ssh_tunnel_if_needed,
     mysql_connect,
@@ -72,7 +72,7 @@ def run_job() -> int:
     }, indent=2))
 
     sink = CSVSink()
-    registry = WatermarkRegistry()
+    registry = run_registry()
 
     tunnel = None
     key_ctx = None

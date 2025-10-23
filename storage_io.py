@@ -300,7 +300,7 @@ class CSVSink:
 
 # -------------------- Watermark registry --------------------
 
-class WatermarkRegistry:
+class run_registry:
     """
     Persists per-table watermark JSON at WATERMARK_DIR/<table>.json
     (You can set WATERMARK_DIR to e.g. `${OUTPUT_BASE_PATH}/json logs/watermarks`.)
@@ -310,7 +310,7 @@ class WatermarkRegistry:
         self.account = _get("STORAGE_ACCOUNT")
         self.container = _get("FILE_SYSTEM")
         self.storage_kind = _get("STORAGE_KIND", "adls").lower()
-        self.dir = (_get("WATERMARK_DIR", "watermarks")).strip().strip("/")
+        self.dir = (_get("WATERMARK_DIR", "moodle/prod/run_registry")).strip().strip("/")
 
         if self.local_out:
             self.mode = "local"
@@ -341,13 +341,6 @@ class WatermarkRegistry:
         rel = self._rel(table)
 
         try:
-            if self.mode == "local":
-                path = os.path.join(self.local_out, rel.replace("/", os.sep))
-                if not os.path.exists(path):
-                    return None
-                with open(path, "rb") as f:
-                    return json.loads(f.read().decode("utf-8"))
-
             if self.mode == "adls":
                 file = self.fs.get_file_client(rel)
                 data = file.download_file().readall()
@@ -372,14 +365,6 @@ class WatermarkRegistry:
             "updated_utc": datetime.utcnow().isoformat() + "Z",
         }
         data = (json.dumps(payload, indent=2) + "\n").encode("utf-8")
-
-        if self.mode == "local":
-            path = os.path.join(self.local_out, rel.replace("/", os.sep))
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "wb") as f:
-                f.write(data)
-            print(f"[wm] saved → {path}")
-            return
 
         if self.mode == "adls":
             file = self.fs.get_file_client(rel)
