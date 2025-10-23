@@ -36,7 +36,6 @@ def _safe_int(x):
     try:
         return int(x)
     except Exception:
-        # fallback when columns are datetime; for Moodle they are ints, but keep flexible
         return None
 
 def _max_col(batch, col):
@@ -45,8 +44,7 @@ def _max_col(batch, col):
     vals = [row.get(col) for row in batch if row.get(col) is not None]
     if not vals:
         return None
-    # Prefer int if possible
-    ints = [v for v in ( _safe_int(v) for v in vals ) if v is not None]
+    ints = [v for v in (_safe_int(v) for v in vals) if v is not None]
     if ints:
         return max(ints)
     try:
@@ -65,7 +63,7 @@ def run_job() -> int:
     print(json.dumps({
         "connect_via": _get("CONNECT_VIA", "SSH").upper(),
         "storage_kind": _get("STORAGE_KIND", "adls").lower(),
-        "output_dir": _get("OUTPUT_DIR"),  # e.g., 2025/09/24 or auto YYYY/MM/DD
+        "output_base_path": _get("OUTPUT_BASE_PATH"),
         "watermark_dir": _get("WATERMARK_DIR", "watermarks"),
         "format": "csv",
         "tables": [t["name"] for t in TABLE_SPECS]
