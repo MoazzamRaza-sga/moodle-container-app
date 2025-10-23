@@ -373,7 +373,7 @@ def rows_to_table(rows):
     return pa.Table.from_pylist(rows)
 
 def run_job():
-    table = _get("COURSE_TABLE", "tbl_course")
+    table = _get("COURSE_TABLE", "mdl_course")
     pk_col = _get("COURSE_PK")
     watermark_col = _get("WATERMARK_COLUMN")
     last_watermark = _get("LAST_WATERMARK")
