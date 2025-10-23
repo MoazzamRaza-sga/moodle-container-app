@@ -5,11 +5,12 @@ from contextlib import contextmanager
 from dotenv import load_dotenv
 from sshtunnel import SSHTunnelForwarder
 import pymysql
-from pymysql.cursors import SSCursor, SSDictCursor  # server-side (streaming) cursors
+from pymysql.cursors import SSCursor, SSDictCursor
 
-# Storage (ADLS Gen2)
+# Storage SDKs
 from azure.identity import DefaultAzureCredential
 from azure.storage.filedatalake import DataLakeServiceClient
+from azure.storage.blob import BlobServiceClient, BlobClient
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -27,7 +28,6 @@ def _get(name, default=None):
     v = os.getenv(name)
     return v if v is not None and v != "" else default
 
-# NEW: resolve managed identity client id if supplied (user-assigned)
 def _default_azure_credential():
     mi_client_id = _get("AZURE_CLIENT_ID")
     if mi_client_id:
@@ -37,46 +37,99 @@ def _default_azure_credential():
 @contextmanager
 def temp_pem_from_env():
     """
-    Accepts either:
-      - SSH_PRIVATE_KEY (PEM text), or
-      - SSH_PRIVATE_KEY_PATH (path to .pem file)
-    Returns a temp file path usable by ssh.
+    Sources (priority order):
+      1) SSH_PRIVATE_KEY (PEM text in env)
+      2) SSH_PRIVATE_KEY_PATH (path in container)
+      3) SSH_KEY_PATH in ADLS Gen2 (account/container/path)
+      4) SSH_KEY_BLOB_URL (full https Blob URL; MI or SAS)
+    Yields a temp file path and cleans up on exit.
     """
     pem_text = os.getenv("SSH_PRIVATE_KEY")
     pem_path = os.getenv("SSH_PRIVATE_KEY_PATH")
+    adls_rel = os.getenv("SSH_KEY_PATH")  # e.g. secrets/razamo-key.pem
+    blob_url = os.getenv("SSH_KEY_BLOB_URL")
 
+    # 1) raw PEM
     if pem_text:
         fd, path = tempfile.mkstemp(prefix="id_", suffix=".pem")
-        with os.fdopen(fd, "w") as f:
-            f.write(pem_text)
+        with os.fdopen(fd, "w") as f: f.write(pem_text)
         try:
-            # chmod 600 is not enforced on Windows; ignore if it fails there.
             os.chmod(path, 0o600)
         except Exception:
-            if platform.system().lower() != "windows":
-                raise
+            if platform.system().lower() != "windows": raise
         try:
+            print("[ssh] using private key from env")
             yield path
         finally:
-            try:
-                os.remove(path)
-            except Exception:
-                pass
-    elif pem_path:
-        yield pem_path
-    else:
-        # NEW: allow password-based SSH elsewhere; return None here.
-        yield None
+            try: os.remove(path)
+            except Exception: pass
+        return
 
-# ---------- Storage (ADLS/local) ----------
+    # 2) direct path
+    if pem_path:
+        print(f"[ssh] using private key from path: {pem_path}")
+        yield pem_path
+        return
+
+    cred = _default_azure_credential()
+
+    # 3) ADLS Gen2 (dfs) by account/container/path
+    if adls_rel:
+        account = os.getenv("SSH_KEY_ACCOUNT") or os.getenv("STORAGE_ACCOUNT")
+        fs_name = os.getenv("SSH_KEY_FILE_SYSTEM") or os.getenv("FILE_SYSTEM")
+        if not account or not fs_name:
+            raise RuntimeError("For ADLS key, set SSH_KEY_ACCOUNT (or STORAGE_ACCOUNT) and SSH_KEY_FILE_SYSTEM (or FILE_SYSTEM).")
+        acct_url = f"https://{account}.dfs.core.windows.net"
+        dls = DataLakeServiceClient(account_url=acct_url, credential=cred)
+        file_client = dls.get_file_system_client(fs_name).get_file_client(adls_rel)
+        key_bytes = file_client.download_file().readall()
+        fd, path = tempfile.mkstemp(prefix="id_", suffix=".pem")
+        with os.fdopen(fd, "wb") as f: f.write(key_bytes)
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            if platform.system().lower() != "windows": raise
+        try:
+            print(f"[ssh] downloaded key from ADLS: abfss://{fs_name}@{account}.dfs.core.windows.net/{adls_rel}")
+            yield path
+        finally:
+            try: os.remove(path)
+            except Exception: pass
+        return
+
+    # 4) Blob URL (blob.core.windows.net) with MI or SAS
+    if blob_url:
+        # If SAS is embedded, credential can be omitted; MI works when no SAS is present.
+        bc = BlobClient.from_blob_url(blob_url, credential=cred)
+        key_bytes = bc.download_blob().readall()
+        fd, path = tempfile.mkstemp(prefix="id_", suffix=".pem")
+        with os.fdopen(fd, "wb") as f: f.write(key_bytes)
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            if platform.system().lower() != "windows": raise
+        try:
+            print(f"[ssh] downloaded key from Blob URL: {blob_url}")
+            yield path
+        finally:
+            try: os.remove(path)
+            except Exception: pass
+        return
+
+    print("[ssh] no key provided via env/path/storage")
+    yield None
+
+# ---------- Storage (ADLS Gen2 or Blob) ----------
 
 class ParquetSink:
     def __init__(self):
         self.local_out = _get("LOCAL_OUTPUT_DIR")
         self.account = _get("STORAGE_ACCOUNT")
-        self.fs_name = _get("FILE_SYSTEM")
+        self.container = _get("FILE_SYSTEM")  # ADLS filesystem or Blob container
         self.base_path = _get("OUTPUT_BASE_PATH", "bronze/course")
         self.compression = _get("PARQUET_COMPRESSION", "snappy").lower()
+        self.storage_kind = _get("STORAGE_KIND", "adls").lower()  # 'adls' (dfs) or 'blob'
+
         now = datetime.utcnow()
         self.run_ts = now.strftime("%Y%m%dT%H%M%SZ")
         self.ingestion_date = now.strftime("%Y-%m-%d")
@@ -85,15 +138,26 @@ class ParquetSink:
             os.makedirs(self.local_out, exist_ok=True)
             self.mode = "local"
             print(f"[sink] Using local output: {self.local_out}")
-        else:
-            if not self.account or not self.fs_name:
-                raise RuntimeError("For ADLS, set STORAGE_ACCOUNT and FILE_SYSTEM.")
+            return
+
+        if not self.account or not self.container:
+            raise RuntimeError("For cloud sink, set STORAGE_ACCOUNT and FILE_SYSTEM (container).")
+
+        cred = _default_azure_credential()
+        if self.storage_kind == "adls":
             self.mode = "adls"
             acct_url = f"https://{self.account}.dfs.core.windows.net"
-            cred = _default_azure_credential()  # NEW: user-assigned MI support
             self.dls = DataLakeServiceClient(account_url=acct_url, credential=cred)
-            self.fs = self.dls.get_file_system_client(self.fs_name)
-            print(f"[sink] Using ADLS: {acct_url}/{self.fs_name}")
+            self.fs = self.dls.get_file_system_client(self.container)
+            print(f"[sink] Using ADLS (dfs): {acct_url}/{self.container}")
+        elif self.storage_kind == "blob":
+            self.mode = "blob"
+            acct_url = f"https://{self.account}.blob.core.windows.net"
+            self.bsc = BlobServiceClient(account_url=acct_url, credential=cred)
+            self.cc = self.bsc.get_container_client(self.container)
+            print(f"[sink] Using Blob (blob): {acct_url}/{self.container}")
+        else:
+            raise RuntimeError("STORAGE_KIND must be 'adls' or 'blob'.")
 
     def _build_rel_path(self, part_idx: int):
         return (
@@ -104,25 +168,28 @@ class ParquetSink:
         )
 
     def write_table(self, table: pa.Table, part_idx: int):
-        # to in-memory parquet
         buf = pa.BufferOutputStream()
         pq.write_table(table, buf, compression=self.compression)
         data = buf.getvalue().to_pybytes()
-
         rel = self._build_rel_path(part_idx)
 
         if self.mode == "local":
             out_path = os.path.join(self.local_out, rel.replace("/", os.sep))
             os.makedirs(os.path.dirname(out_path), exist_ok=True)
-            with open(out_path, "wb") as f:
-                f.write(data)
+            with open(out_path, "wb") as f: f.write(data)
             print(f"[sink] wrote {len(data)} bytes → {out_path}")
             return out_path
 
-        # ADLS
-        file = self.fs.get_file_client(rel)
-        file.upload_data(data, overwrite=True)
-        print(f"[sink] wrote {len(data)} bytes → abfss://{self.fs_name}@{self.account}.dfs.core.windows.net/{rel}")
+        if self.mode == "adls":
+            file = self.fs.get_file_client(rel)
+            file.upload_data(data, overwrite=True)
+            print(f"[sink] wrote {len(data)} bytes → abfss://{self.container}@{self.account}.dfs.core.windows.net/{rel}")
+            return rel
+
+        # blob
+        bc = self.cc.get_blob_client(rel)
+        bc.upload_blob(data, overwrite=True)
+        print(f"[sink] wrote {len(data)} bytes → https://{self.account}.blob.core.windows.net/{self.container}/{rel}")
         return rel
 
     def write_success_marker(self, total_rows: int, parts: int, extras: dict):
@@ -137,23 +204,29 @@ class ParquetSink:
             "created_utc": datetime.utcnow().isoformat() + "Z",
         }
         payload = (json.dumps(marker, indent=2) + "\n").encode("utf-8")
-
         rel = (
             f"{self.base_path}/"
             f"ingestion_date={self.ingestion_date}/"
             f"run_ts={self.run_ts}/_SUCCESS.json"
         )
+
         if self.mode == "local":
             path = os.path.join(self.local_out, rel.replace("/", os.sep))
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "wb") as f:
-                f.write(payload)
+            with open(path, "wb") as f: f.write(payload)
             print(f"[sink] wrote marker → {path}")
             return
 
-        file = self.fs.get_file_client(rel)
-        file.upload_data(payload, overwrite=True)
-        print(f"[sink] wrote marker → abfss://{self.fs_name}@{self.account}.dfs.core.windows.net/{rel}")
+        if self.mode == "adls":
+            file = self.fs.get_file_client(rel)
+            file.upload_data(payload, overwrite=True)
+            print(f"[sink] wrote marker → abfss://{self.container}@{self.account}.dfs.core.windows.net/{rel}")
+            return
+
+        # blob
+        bc = self.cc.get_blob_client(rel)
+        bc.upload_blob(payload, overwrite=True)
+        print(f"[sink] wrote marker → https://{self.account}.blob.core.windows.net/{self.container}/{rel}")
 
 # ---------- MySQL (SSH or DIRECT) ----------
 
@@ -169,21 +242,30 @@ def make_ssh_tunnel_if_needed():
     db_host = _get("DB_HOST", "127.0.0.1")
     db_port = int(_get("DB_PORT", "3306"))
 
-    ssh_password = _get("SSH_PASSWORD")
+    ssh_password = _get("SSH_PASSWORD")       # may unlock encrypted key
+    ssh_passphrase = _get("SSH_PASSPHRASE")   # explicit passphrase
+
     key_ctx = temp_pem_from_env()
-    key_path = key_ctx.__enter__()  # may be None if using password
+    key_path = key_ctx.__enter__()
 
     kwargs = {
         "ssh_address_or_host": (ssh_host, ssh_port),
         "ssh_username": ssh_user,
         "remote_bind_address": (db_host, db_port),
     }
-    if ssh_password and not key_path:
-        kwargs["ssh_password"] = ssh_password
-    else:
-        if not key_path:
-            raise RuntimeError("Provide SSH_PRIVATE_KEY/SSH_PRIVATE_KEY_PATH or SSH_PASSWORD")
+
+    if key_path:
         kwargs["ssh_pkey"] = key_path
+        if ssh_passphrase:
+            kwargs["ssh_private_key_password"] = ssh_passphrase
+        elif ssh_password:
+            kwargs["ssh_private_key_password"] = ssh_password
+        print("[ssh] authenticating with private key")
+    elif ssh_password:
+        kwargs["ssh_password"] = ssh_password
+        print("[ssh] authenticating with password")
+    else:
+        raise RuntimeError("No SSH key or password provided. Set SSH_PRIVATE_KEY / SSH_PRIVATE_KEY_PATH / SSH_KEY_PATH / SSH_KEY_BLOB_URL, or SSH_PASSWORD.")
 
     tunnel = SSHTunnelForwarder(**kwargs)
     tunnel.start()
@@ -191,17 +273,12 @@ def make_ssh_tunnel_if_needed():
     return tunnel, key_ctx
 
 def mysql_ssl_kwargs():
-    """Build TLS settings for PyMySQL based on env."""
     mode = (_get("DB_SSL_MODE") or "").lower()
     ca_path = _get("DB_SSL_CA_PATH", "/etc/ssl/certs/ca-certificates.crt")
-
     if mode == "disabled":
         return {}
-
-    # If verify_ca, provide CA path; if required (no verify), empty dict enables TLS.
     if mode == "verify_ca":
         return {"ssl": {"ca": ca_path}}
-    # default to 'required' (TLS without explicit CA)
     return {"ssl": {}}
 
 def mysql_connect(tunnel):
@@ -213,19 +290,19 @@ def mysql_connect(tunnel):
     if tunnel and connect_via == "SSH":
         host = "127.0.0.1"
         port = tunnel.local_bind_port
-        ssl_kwargs = {}  # tunnel is already encrypted
+        ssl_kwargs = {}
     else:
         host = _require("DB_HOST")
         port = int(_get("DB_PORT", "3306"))
         ssl_kwargs = mysql_ssl_kwargs()
 
-    conn = pymysql.connect(
+    return pymysql.connect(
         host=host,
         port=port,
         user=db_user,
         password=db_pass,
         database=db_name,
-        cursorclass=SSDictCursor,  # streaming dict cursor
+        cursorclass=SSDictCursor,
         connect_timeout=10,
         read_timeout=120,
         write_timeout=120,
@@ -233,7 +310,6 @@ def mysql_connect(tunnel):
         autocommit=False,
         **ssl_kwargs
     )
-    return conn
 
 # ---------- Extract & Write ----------
 
@@ -244,8 +320,7 @@ def fetch_pk_bounds(conn, table, pk_col):
     return row.get("lo"), row.get("hi")
 
 def build_where_clause(pk_col, watermark_col, last_watermark):
-    clauses = []
-    params = []
+    clauses, params = [], []
     if last_watermark and watermark_col:
         clauses.append(f"`{watermark_col}` > %s")
         params.append(last_watermark)
@@ -255,20 +330,12 @@ def build_where_clause(pk_col, watermark_col, last_watermark):
 def extract_in_chunks_by_pk(conn, table, pk_col, chunk_size, watermark_col=None, last_watermark=None, max_rows=None):
     lo, hi = fetch_pk_bounds(conn, table, pk_col)
     if lo is None:
-        return  # empty table
-
+        return
     where_sql, params = build_where_clause(pk_col, watermark_col, last_watermark)
-
-    rows_read = 0
-    last_pk = lo - 1
+    rows_read, last_pk = 0, lo - 1
     while True:
-        limit = chunk_size
-        if max_rows is not None:
-            remaining = max_rows - rows_read
-            if remaining <= 0:
-                break
-            limit = min(limit, remaining)
-
+        limit = chunk_size if max_rows is None else min(chunk_size, max(0, max_rows - rows_read))
+        if limit == 0: break
         sql = (
             f"SELECT * FROM `{table}` "
             f"{where_sql} {'AND' if where_sql else 'WHERE'} `{pk_col}` > %s "
@@ -278,37 +345,23 @@ def extract_in_chunks_by_pk(conn, table, pk_col, chunk_size, watermark_col=None,
         with conn.cursor() as cur:
             cur.execute(sql, qparams)
             batch = cur.fetchall()
-
-        if not batch:
-            break
-
+        if not batch: break
         rows_read += len(batch)
         last_pk = batch[-1][pk_col]
         yield batch
 
 def extract_in_chunks_by_offset(conn, table, chunk_size, watermark_col=None, last_watermark=None, max_rows=None):
     where_sql, params = build_where_clause(None, watermark_col, last_watermark)
-    # Note: OFFSET can be slow on huge tables; PK paging is preferred.
-    offset = 0
-    rows_read = 0
-
+    offset, rows_read = 0, 0
     while True:
-        limit = chunk_size
-        if max_rows is not None:
-            remaining = max_rows - rows_read
-            if remaining <= 0:
-                break
-            limit = min(limit, remaining)
-
+        limit = chunk_size if max_rows is None else min(chunk_size, max(0, max_rows - rows_read))
+        if limit == 0: break
         sql = f"SELECT * FROM `{table}` {where_sql} LIMIT %s OFFSET %s"
         qparams = params + [limit, offset]
         with conn.cursor() as cur:
             cur.execute(sql, qparams)
             batch = cur.fetchall()
-
-        if not batch:
-            break
-
+        if not batch: break
         rows_read += len(batch)
         offset += len(batch)
         yield batch
@@ -316,23 +369,22 @@ def extract_in_chunks_by_offset(conn, table, chunk_size, watermark_col=None, las
 def rows_to_table(rows):
     if not rows:
         return None
-    # Let Arrow infer schema; for DECIMAL heavy schemas you might want to cast explicitly.
     return pa.Table.from_pylist(rows)
 
 def run_job():
-    # ---- Config from env ----
     table = _get("COURSE_TABLE", "tbl_course")
-    pk_col = _get("COURSE_PK")  # e.g., "id"; if missing, falls back to OFFSET paging
-    watermark_col = _get("WATERMARK_COLUMN")        # e.g., "updated_at"
-    last_watermark = _get("LAST_WATERMARK")         # ISO or MySQL datetime string
-    chunk_size = int(_get("CHUNK_SIZE", "200000"))  # tune based on width
+    pk_col = _get("COURSE_PK")
+    watermark_col = _get("WATERMARK_COLUMN")
+    last_watermark = _get("LAST_WATERMARK")
+    chunk_size = int(_get("CHUNK_SIZE", "200000"))
     max_rows = _get("MAX_ROWS")
     max_rows = int(max_rows) if max_rows else None
 
     print(json.dumps({
         "table": table, "pk_col": pk_col, "watermark_col": watermark_col,
         "last_watermark": last_watermark, "chunk_size": chunk_size, "max_rows": max_rows,
-        "connect_via": _get("CONNECT_VIA", "SSH").upper()
+        "connect_via": _get("CONNECT_VIA", "SSH").upper(),
+        "storage_kind": _get("STORAGE_KIND", "adls").lower()
     }, indent=2))
 
     sink = ParquetSink()
@@ -347,7 +399,6 @@ def run_job():
         tunnel, key_ctx = make_ssh_tunnel_if_needed()
         conn = mysql_connect(tunnel)
 
-        # Choose strategy
         if pk_col:
             chunk_iter = extract_in_chunks_by_pk(
                 conn, table, pk_col, chunk_size,
@@ -369,14 +420,10 @@ def run_job():
             parts += 1
             print(f"[batch] wrote part {i-1}, rows={tbl.num_rows}, total_rows={total_rows}")
 
-        # Marker + metrics
         duration_s = (datetime.utcnow() - started).total_seconds()
         sink.write_success_marker(
-            total_rows=total_rows,
-            parts=parts,
-            extras={"duration_seconds": duration_s}
+            total_rows=total_rows, parts=parts, extras={"duration_seconds": duration_s}
         )
-
         print(f"[done] total_rows={total_rows}, parts={parts}, duration_s={duration_s:.2f}")
         return 0
 
@@ -385,15 +432,12 @@ def run_job():
         return 1
 
     finally:
-        # Cleanup
         try:
-            if tunnel:
-                tunnel.stop()
+            if tunnel: tunnel.stop()
         except Exception:
             pass
         try:
-            if key_ctx:
-                key_ctx.__exit__(None, None, None)
+            if key_ctx: key_ctx.__exit__(None, None, None)
         except Exception:
             pass
 
