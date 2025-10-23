@@ -89,10 +89,7 @@ class CSVSink:
 
         # Dynamic date (YYYY/MM/DD) in OUTPUT_TZ (fallback UTC)
         tz_name = _get("OUTPUT_TZ", "Asia/Karachi")
-        if ZoneInfo:
-            now = datetime.now(ZoneInfo(tz_name))
-        else:
-            now = datetime.utcnow()
+        now = datetime.utcnow()
         self.y = f"{now.year:04d}"
         self.m = f"{now.month:02d}"
         self.d = f"{now.day:02d}"
