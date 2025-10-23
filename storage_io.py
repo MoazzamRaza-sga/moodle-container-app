@@ -1,7 +1,6 @@
 import os
 import json
 import tempfile
-import time
 from datetime import datetime
 from typing import Optional, Dict, Any
 
@@ -13,7 +12,6 @@ from azure.identity import DefaultAzureCredential
 from azure.storage.filedatalake import DataLakeServiceClient
 from azure.storage.blob import BlobServiceClient, BlobClient
 from azure.core.exceptions import ResourceNotFoundError
-from azure.core.pipeline.policies import RetryPolicy
 
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
@@ -40,43 +38,28 @@ def _default_azure_credential():
     return DefaultAzureCredential()
 
 
-# -------------------- Low-level storage helpers (RESTORED) --------------------
-
-def _retry_policy():
-    return RetryPolicy(
-        retry_total=int(_get("AZURE_RETRIES", "7")),
-        retry_mode="exponential",
-        retry_backoff_factor=float(_get("AZURE_RETRY_BACKOFF", "0.8")),
-    )
+# -------------------- Low-level storage helpers (used by mysql_conn) --------------------
 
 def _get_adls_clients(account: str, filesystem: str):
     cred = _default_azure_credential()
     acct_url = f"https://{account}.dfs.core.windows.net"
-    dls = DataLakeServiceClient(account_url=acct_url, credential=cred, retry_policy=_retry_policy())
+    dls = DataLakeServiceClient(account_url=acct_url, credential=cred)
     fs = dls.get_file_system_client(filesystem)
     return dls, fs
 
 def download_adls_path_to_bytes(rel_path: str,
                                 account: Optional[str] = None,
                                 filesystem: Optional[str] = None) -> bytes:
-    """
-    Download a file from ADLS Gen2 (DFS endpoint) to memory.
-    If account/filesystem are not provided, falls back to STORAGE_ACCOUNT/FILE_SYSTEM.
-    """
     account = account or _require("STORAGE_ACCOUNT")
     filesystem = filesystem or _require("FILE_SYSTEM")
     _, fs = _get_adls_clients(account, filesystem)
     file_client = fs.get_file_client(rel_path)
-    # readall() is already chunked under the hood
     return file_client.download_file().readall()
 
 def download_blob_url_to_bytes(blob_url: str) -> bytes:
-    """
-    Download from a full Blob URL (works with SAS or MI). Uses low concurrency to avoid throttling.
-    """
     cred = _default_azure_credential()
-    # from_blob_url doesn't take retry_policy, so we just limit concurrency on download
     bc = BlobClient.from_blob_url(blob_url, credential=cred)
+    # keep concurrency to 1 to avoid throttling
     return bc.download_blob(max_concurrency=1).readall()
 
 
@@ -133,17 +116,13 @@ class CSVSink:
             if self.storage_kind == "adls":
                 self.mode = "adls"
                 acct_url = f"https://{self.account}.dfs.core.windows.net"
-                self.dls = DataLakeServiceClient(
-                    account_url=acct_url, credential=cred, retry_policy=_retry_policy()
-                )
+                self.dls = DataLakeServiceClient(account_url=acct_url, credential=cred)
                 self.fs = self.dls.get_file_system_client(self.container)
                 print(f"[sink] Using ADLS (dfs): {acct_url}/{self.container}")
             elif self.storage_kind == "blob":
                 self.mode = "blob"
                 acct_url = f"https://{self.account}.blob.core.windows.net"
-                self.bsc = BlobServiceClient(
-                    account_url=acct_url, credential=cred, retry_policy=_retry_policy()
-                )
+                self.bsc = BlobServiceClient(account_url=acct_url, credential=cred)
                 self.cc = self.bsc.get_container_client(self.container)
                 print(f"[sink] Using Blob (blob): {acct_url}/{self.container}")
             else:
@@ -342,17 +321,15 @@ class WatermarkRegistry:
             raise RuntimeError("For cloud registry, set STORAGE_ACCOUNT and FILE_SYSTEM (container).")
 
         cred = _default_azure_credential()
-        rp = _retry_policy()
-
         if self.storage_kind == "adls":
             self.mode = "adls"
             acct_url = f"https://{self.account}.dfs.core.windows.net"
-            self.dls = DataLakeServiceClient(account_url=acct_url, credential=cred, retry_policy=rp)
+            self.dls = DataLakeServiceClient(account_url=acct_url, credential=cred)
             self.fs = self.dls.get_file_system_client(self.container)
         elif self.storage_kind == "blob":
             self.mode = "blob"
             acct_url = f"https://{self.account}.blob.core.windows.net"
-            self.bsc = BlobServiceClient(account_url=acct_url, credential=cred, retry_policy=rp)
+            self.bsc = BlobServiceClient(account_url=acct_url, credential=cred)
             self.cc = self.bsc.get_container_client(self.container)
         else:
             raise RuntimeError("STORAGE_KIND must be 'adls' or 'blob'.")

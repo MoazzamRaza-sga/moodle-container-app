@@ -124,7 +124,7 @@ def mysql_connect(tunnel: Optional[SSHTunnelForwarder]) -> pymysql.connections.C
         port = tunnel.local_bind_port
         ssl_kwargs = {}
     else:
-        host = _require("DB_HOST")
+        host = _require("DB_HOST","127.0.0.1")
         port = int(_get("DB_PORT", "3306"))
         ssl_kwargs = mysql_ssl_kwargs()
 
