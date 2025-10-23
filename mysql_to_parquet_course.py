@@ -107,8 +107,7 @@ def run_job() -> int:
                 conn, name, pk_col, chunk_size,
                 watermark_col=wm_col,
                 last_watermark=last_value_int if wm_col else None,
-                max_rows=max_rows,
-                last_pk_start=last_pk_start
+                max_rows=max_rows
             )
 
             for i, rows in enumerate(chunk_iter, start=1):
