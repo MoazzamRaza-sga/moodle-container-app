@@ -29,6 +29,7 @@ TABLE_SPECS = [
     {"name": "mdl_tag",                             "pk": "id", "wm": "timemodified"},
     {"name": "mdl_tag_instance",                    "pk": "id", "wm": "timecreated"},
     {"name": "mdl_user_lastaccess",                 "pk": "id", "wm": "timeaccess"},
+    {"name": "mdl_user",                            "pk": "id", "wm": "timemodified"}
 ]
 
 def _safe_int(x):

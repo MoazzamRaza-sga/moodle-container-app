@@ -249,14 +249,15 @@ class CSVSink:
         self._prepare_table(tbl)
 
         # Sanitize: force every value to a UTF-8 string and clean control chars
-        table_pa = _sanitize_table_to_strings(table_pa)
+        # table_pa = _sanitize_table_to_strings(table_pa)
 
         # Include header only for the first chunk of this dataset
         # include_header = not self._state[tbl]["header_written"]
         # write_opts = pacsv.WriteOptions(include_header=include_header)
-
+        
+        write_opts = pacsv.WriteOptions(delimiter="|")
         buf = pa.BufferOutputStream()
-        pacsv.write_csv(table_pa, buf)
+        pacsv.write_csv(table_pa, buf,write_options=write_opts)
         chunk_bytes = buf.getvalue().to_pybytes()
 
         # Mark header as written after first chunk
