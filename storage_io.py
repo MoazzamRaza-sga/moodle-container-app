@@ -449,6 +449,7 @@ class ParquetSink:
         Creates the writer on first chunk using the chunk schema.
         """
         tbl = dataset_name
+        table_pa = _sanitize_table_to_strings(table_pa)
         if tbl not in self._state:
             self._prepare_table(tbl, table_pa.schema)
 
