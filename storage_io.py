@@ -254,10 +254,14 @@ class CSVSink:
         # Include header only for the first chunk of this dataset
         # include_header = not self._state[tbl]["header_written"]
         # write_opts = pacsv.WriteOptions(include_header=include_header)
-        
-        write_opts = pacsv.WriteOptions(delimiter="|")
+
+        opts = pacsv.WriteOptions(
+                    delimiter="|",
+                    quoting_style="none",      # never add quotes
+                    include_header=True        # keep header (see note below)
+                )
         buf = pa.BufferOutputStream()
-        pacsv.write_csv(table_pa, buf,write_options=write_opts)
+        pacsv.write_csv(table_pa, buf,write_options=opts)
         chunk_bytes = buf.getvalue().to_pybytes()
 
         # Mark header as written after first chunk
