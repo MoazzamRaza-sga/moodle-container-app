@@ -5,7 +5,7 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 
-from storage_io import CSVSink, run_registry, _get
+from storage_io import CSVSink, run_registry, _get,ParquetSink
 from mysql_conn import (
     make_ssh_tunnel_if_needed,
     mysql_connect,
@@ -73,6 +73,7 @@ def run_job() -> int:
     }, indent=2))
 
     sink = CSVSink()
+    psink = ParquetSink(base_path="moddle/prod")
     registry = run_registry()
 
     tunnel = None
@@ -123,6 +124,7 @@ def run_job() -> int:
                         max_seen = batch_max
 
                 sink.write_table(tbl, part_idx=i - 1, dataset_name=name)
+                psink.write_table(tbl, part_idx=i - 1, dataset_name=name)
                 total_rows += tbl.num_rows
                 parts += 1
                 print(f"[{name}] part {i-1}, rows={tbl.num_rows}, total_rows={total_rows}, max_seen={max_seen}")

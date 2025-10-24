@@ -6,7 +6,7 @@ from typing import Optional, Dict, Any
 
 import pyarrow as pa
 import pyarrow.csv as pacsv  # CSV writer
-
+import pyarrow.parquet as pq
 # Azure SDKs
 from azure.identity import DefaultAzureCredential
 from azure.storage.filedatalake import DataLakeServiceClient
@@ -365,6 +365,150 @@ class CSVSink:
         bc = self.cc.get_blob_client(rel_success)
         bc.upload_blob(payload, overwrite=True, max_concurrency=1)
         print(f"[sink] wrote success → https://{self.account}.blob.core.windows.net/{self.container}/{rel_success}")
+
+
+
+# ------------------------- parquet -----------------------------
+
+class ParquetSink:
+    """
+    Writes each table to ONE Parquet file named <table>.parquet.
+
+    Target path in Azure Blob:
+      moddle/prod/<table>/parquet/<YYYY>/<MM>/<DD>/<table>.parquet
+
+    LOCAL mode (if LOCAL_OUTPUT_DIR is set):
+      <LOCAL_OUTPUT_DIR>/moddle/prod/<table>/parquet/<YYYY>/<MM>/<DD>/<table>.parquet
+
+    Env vars used (same convention as your CSVSink):
+      - LOCAL_OUTPUT_DIR (optional: when set, writes locally instead of cloud)
+      - STORAGE_ACCOUNT (required for blob mode)
+      - FILE_SYSTEM     (required for blob mode; this is the Blob container name)
+      - OUTPUT_TZ       (optional; for naming only, defaults to Asia/Karachi)
+      - PARQUET_COMPRESSION (optional; default 'snappy')
+      - OUTPUT_BASE_PATH (optional; overrides base path; default 'moddle/prod')
+    """
+
+    def __init__(self, base_path: Optional[str] = None):
+        # Base path defaults to the structure you asked for
+        self.base_path = (base_path or _get("OUTPUT_BASE_PATH") or "moddle/prod").strip().strip("/")
+
+        self.local_out = _get("LOCAL_OUTPUT_DIR")
+        self.account = _get("STORAGE_ACCOUNT")
+        self.container = _get("FILE_SYSTEM")  # Blob container name
+        self.compression = _get("PARQUET_COMPRESSION", "snappy")
+
+        # Date parts for directory structure (UTC for reproducibility)
+        now = datetime.utcnow()
+        self.y = f"{now.year:04d}"
+        self.m = f"{now.month:02d}"
+        self.d = f"{now.day:02d}"
+
+        # Init backends
+        if self.local_out:
+            os.makedirs(self.local_out, exist_ok=True)
+            self.mode = "local"
+            print(f"[parquet] Using local output: {self.local_out}")
+        else:
+            if not self.account or not self.container:
+                raise RuntimeError("For blob output, set STORAGE_ACCOUNT and FILE_SYSTEM (container).")
+            cred = _default_azure_credential()
+            acct_url = f"https://{self.account}.blob.core.windows.net"
+            self.bsc = BlobServiceClient(account_url=acct_url, credential=cred)
+            self.cc = self.bsc.get_container_client(self.container)
+            self.mode = "blob"
+            print(f"[parquet] Using Blob: {acct_url}/{self.container}")
+
+        # Per-table state:
+        # { table: { "writer": pq.ParquetWriter,
+        #            "tmp_path": str (for blob) or final local path,
+        #            "rel": str } }
+        self._state: Dict[str, Dict[str, Any]] = {}
+
+    # ---------- Path helpers ----------
+    def _data_relpath_for(self, table: str) -> str:
+        return f"{self.base_path}/{table}/parquet/{self.y}/{self.m}/{self.d}/{table}.parquet"
+
+    # ---------- File lifecycle per table ----------
+    def _prepare_table(self, table: str, first_chunk_schema: pa.Schema):
+        if table in self._state:
+            return
+
+        rel = self._data_relpath_for(table)
+
+        if self.mode == "local":
+            # Ensure directories exist and open a writer directly on the final path
+            path = os.path.join(self.local_out, rel.replace("/", os.sep))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            writer = pq.ParquetWriter(path, first_chunk_schema, compression=self.compression)
+            self._state[table] = {
+                "writer": writer,
+                "tmp_path": path,  # this is final when local
+                "rel": rel,
+            }
+            print(f"[parquet] Writing → {path}")
+            return
+
+        # Blob mode: write to a temp file first, upload at finish
+        fd, tmp = tempfile.mkstemp(prefix=f"{table}_", suffix=".parquet")
+        os.close(fd)
+        writer = pq.ParquetWriter(tmp, first_chunk_schema, compression=self.compression)
+        self._state[table] = {
+            "writer": writer,
+            "tmp_path": tmp,
+            "rel": rel,
+        }
+        print(f"[parquet] Buffering → {tmp}  (final: {rel})")
+
+    def write_table(self, table_pa: pa.Table, part_idx: int, dataset_name: str) -> str:
+        """
+        Append a chunk to the Parquet file for the given dataset/table.
+        Creates the writer on first chunk using the chunk schema.
+        """
+        tbl = dataset_name
+        if tbl not in self._state:
+            self._prepare_table(tbl, table_pa.schema)
+
+        writer = self._state[tbl]["writer"]
+        writer.write_table(table_pa)
+        rel = self._state[tbl]["rel"]
+        print(f"[{tbl}] parquet part {part_idx}, rows={table_pa.num_rows}")
+        return rel
+
+    def finish_table(self, dataset_name: str):
+        """
+        Close the writer and upload (if blob mode).
+        """
+        st = self._state.get(dataset_name)
+        if not st:
+            return
+
+        # Close local writer
+        writer: pq.ParquetWriter = st["writer"]
+        if writer:
+            writer.close()
+
+        tmp = st["tmp_path"]
+        rel = st["rel"]
+
+        if self.mode == "blob":
+            # Upload once per table
+            bc = self.cc.get_blob_client(rel)
+            with open(tmp, "rb") as f:
+                bc.upload_blob(f, overwrite=True, max_concurrency=1)
+            print(f"[parquet] uploaded → https://{self.account}.blob.core.windows.net/{self.container}/{rel}")
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
+        # Cleanup state
+        del self._state[dataset_name]
+
+
+
+
+
 
 
 # -------------------- Watermark registry --------------------
