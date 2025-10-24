@@ -125,6 +125,7 @@ def run_job() -> int:
 
                 sink.write_table(tbl, part_idx=i - 1, dataset_name=name)
                 psink.write_table(tbl, part_idx=i - 1, dataset_name=name)
+                psink.finish_table(dataset_name=name)
                 total_rows += tbl.num_rows
                 parts += 1
                 print(f"[{name}] part {i-1}, rows={tbl.num_rows}, total_rows={total_rows}, max_seen={max_seen}")
