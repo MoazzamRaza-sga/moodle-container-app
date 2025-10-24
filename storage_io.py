@@ -397,6 +397,7 @@ class ParquetSink:
         self.account = _get("STORAGE_ACCOUNT")
         self.container = _get("FILE_SYSTEM")  # ADLS filesystem or Blob container
         self.storage_kind = _get("STORAGE_KIND", "adls").lower()  # 'adls' or 'blob'
+        self.compression = _get("PARQUET_COMPRESSION", "snappy")
 
         # Date parts for directory structure (UTC for reproducibility)
         now = datetime.utcnow()
