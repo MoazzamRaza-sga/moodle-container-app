@@ -12,12 +12,40 @@ from azure.identity import DefaultAzureCredential
 from azure.storage.filedatalake import DataLakeServiceClient
 from azure.storage.blob import BlobServiceClient, BlobClient
 from azure.core.exceptions import ResourceNotFoundError
-
+import pyarrow.compute as pc
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
 except Exception:  # pragma: no cover
     ZoneInfo = None
 
+
+def _squash_table_newlines(table: pa.Table) -> pa.Table:
+    """
+    Replace any CR/LF sequences inside *string cells* with a single space.
+    Works on utf8/large_utf8 and dictionary-encoded strings.
+    Leaves non-string columns unchanged.
+    """
+    new_cols = []
+    names = table.schema.names
+
+    for field, col in zip(table.schema, table.columns):
+        t = field.type
+
+        # Dictionary-encoded strings -> cast, then rewrite
+        if pa.types.is_dictionary(t) and (
+            pa.types.is_string(t.value_type) or pa.types.is_large_string(t.value_type)
+        ):
+            col = pc.cast(col, pa.large_string())
+            col = pc.replace_substring_regex(col, pattern=r"[\r\n]+", replacement=" ")
+
+        # Plain string columns
+        elif pa.types.is_string(t) or pa.types.is_large_string(t):
+            col = pc.replace_substring_regex(col, pattern=r"[\r\n]+", replacement=" ")
+
+        # Anything else is left as-is (ints, floats, structs, lists, etc.)
+        new_cols.append(col)
+
+    return pa.Table.from_arrays(new_cols, names)
 
 # -------------------- Env helpers --------------------
 
@@ -248,8 +276,8 @@ class CSVSink:
         tbl = dataset_name
         self._prepare_table(tbl)
 
-        # Sanitize: force every value to a UTF-8 string and clean control chars
-        # table_pa = _sanitize_table_to_strings(table_pa)
+        # 1) Sanitize: remove embedded newlines from string cells
+        table_pa = _squash_table_newlines(table_pa)
 
         # Include header only for the first chunk of this dataset
         # include_header = not self._state[tbl]["header_written"]
