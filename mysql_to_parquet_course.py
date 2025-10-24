@@ -125,7 +125,7 @@ def run_job() -> int:
 
                 sink.write_table(tbl, part_idx=i - 1, dataset_name=name)
                 psink.write_table(tbl, part_idx=i - 1, dataset_name=name)
-                psink.finish_table(dataset_name=name)
+                
                 total_rows += tbl.num_rows
                 parts += 1
                 print(f"[{name}] part {i-1}, rows={tbl.num_rows}, total_rows={total_rows}, max_seen={max_seen}")
@@ -134,6 +134,7 @@ def run_job() -> int:
             sink.write_success_marker(
                 total_rows=total_rows, parts=parts, extras={"duration_seconds": duration_s}, dataset_name=name
             )
+            psink.finish_table(dataset_name=name)
             print(f"[{name}] done total_rows={total_rows}, parts={parts}, duration_s={duration_s:.2f}")
 
             if parts > 0 and max_seen is not None:
