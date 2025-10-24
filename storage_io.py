@@ -257,7 +257,6 @@ class CSVSink:
 
         opts = pacsv.WriteOptions(
                     delimiter="|",
-                    quoting_style="none",      # never add quotes
                     include_header=True        # keep header (see note below)
                 )
         buf = pa.BufferOutputStream()
