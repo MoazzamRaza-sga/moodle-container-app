@@ -62,6 +62,40 @@ def download_blob_url_to_bytes(blob_url: str) -> bytes:
     # keep concurrency to 1 to avoid throttling
     return bc.download_blob(max_concurrency=1).readall()
 
+# -------------------- CSV sanitizers --------------------
+
+_ALLOWED_CTRL = {9, 10, 13}  # \t, \n, \r
+
+def _to_text(value) -> str:
+    """Coerce any value to a sanitized UTF-8 string."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        s = value.decode("utf-8", "replace")
+    else:
+        s = str(value)
+
+    # Normalize newlines and strip nasty control characters (keep \t \n \r)
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = "".join(ch if (ord(ch) >= 32 or ord(ch) in _ALLOWED_CTRL) else " " for ch in s)
+    return s
+
+def _sanitize_table_to_strings(table: pa.Table) -> pa.Table:
+    """
+    Convert every column to string and sanitize each value.
+    Works chunk-by-chunk to keep memory usage predictable.
+    """
+    names = table.schema.names
+    cols = []
+    for name in names:
+        # Convert one column at a time
+        pylist = table.column(name).to_pylist()
+        san = [_to_text(v) for v in pylist]
+        cols.append(pa.array(san, type=pa.string()))
+    return pa.table(cols, names=names)
+
+
+
 
 # -------------------- CSV sink (single file per table per run) --------------------
 
@@ -214,6 +248,10 @@ class CSVSink:
         tbl = dataset_name
         self._prepare_table(tbl)
 
+        # Sanitize: force every value to a UTF-8 string and clean control chars
+        table_pa = _sanitize_table_to_strings(table_pa)
+
+        # Include header only for the first chunk of this dataset
         # include_header = not self._state[tbl]["header_written"]
         # write_opts = pacsv.WriteOptions(include_header=include_header)
 
@@ -221,12 +259,14 @@ class CSVSink:
         pacsv.write_csv(table_pa, buf)
         chunk_bytes = buf.getvalue().to_pybytes()
 
+        # Mark header as written after first chunk
         self._state[tbl]["header_written"] = True
         rel = self._state[tbl]["rel"]
 
         if self.mode == "local":
             path = os.path.join(self.local_out, rel.replace("/", os.sep))
             with open(path, "ab") as f:
+                # Bytes are already UTF-8 from Arrow; we just append them.
                 f.write(chunk_bytes)
             return rel
 
