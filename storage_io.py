@@ -391,12 +391,12 @@ class ParquetSink:
 
     def __init__(self, base_path: Optional[str] = None):
         # Base path defaults to the structure you asked for
-        self.base_path = (base_path or _get("OUTPUT_BASE_PATH") or "moddle/prod").strip().strip("/")
+        self.base_path = _require("OUTPUT_BASE_PATH").strip().strip("/")
 
         self.local_out = _get("LOCAL_OUTPUT_DIR")
         self.account = _get("STORAGE_ACCOUNT")
-        self.container = _get("FILE_SYSTEM")  # Blob container name
-        self.compression = _get("PARQUET_COMPRESSION", "snappy")
+        self.container = _get("FILE_SYSTEM")  # ADLS filesystem or Blob container
+        self.storage_kind = _get("STORAGE_KIND", "adls").lower()  # 'adls' or 'blob'
 
         # Date parts for directory structure (UTC for reproducibility)
         now = datetime.utcnow()
@@ -404,20 +404,15 @@ class ParquetSink:
         self.m = f"{now.month:02d}"
         self.d = f"{now.day:02d}"
 
-        # Init backends
-        if self.local_out:
-            os.makedirs(self.local_out, exist_ok=True)
-            self.mode = "local"
-            print(f"[parquet] Using local output: {self.local_out}")
-        else:
-            if not self.account or not self.container:
-                raise RuntimeError("For blob output, set STORAGE_ACCOUNT and FILE_SYSTEM (container).")
-            cred = _default_azure_credential()
-            acct_url = f"https://{self.account}.blob.core.windows.net"
-            self.bsc = BlobServiceClient(account_url=acct_url, credential=cred)
-            self.cc = self.bsc.get_container_client(self.container)
-            self.mode = "blob"
-            print(f"[parquet] Using Blob: {acct_url}/{self.container}")
+        
+        if not self.account or not self.container:
+            raise RuntimeError("For blob output, set STORAGE_ACCOUNT and FILE_SYSTEM (container).")
+        cred = _default_azure_credential()
+        acct_url = f"https://{self.account}.blob.core.windows.net"
+        self.bsc = BlobServiceClient(account_url=acct_url, credential=cred)
+        self.cc = self.bsc.get_container_client(self.container)
+        self.mode = "blob"
+        print(f"[parquet] Using Blob: {acct_url}/{self.container}")
 
         # Per-table state:
         # { table: { "writer": pq.ParquetWriter,
@@ -435,19 +430,6 @@ class ParquetSink:
             return
 
         rel = self._data_relpath_for(table)
-
-        if self.mode == "local":
-            # Ensure directories exist and open a writer directly on the final path
-            path = os.path.join(self.local_out, rel.replace("/", os.sep))
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            writer = pq.ParquetWriter(path, first_chunk_schema, compression=self.compression)
-            self._state[table] = {
-                "writer": writer,
-                "tmp_path": path,  # this is final when local
-                "rel": rel,
-            }
-            print(f"[parquet] Writing → {path}")
-            return
 
         # Blob mode: write to a temp file first, upload at finish
         fd, tmp = tempfile.mkstemp(prefix=f"{table}_", suffix=".parquet")
