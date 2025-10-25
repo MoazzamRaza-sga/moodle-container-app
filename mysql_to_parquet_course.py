@@ -17,7 +17,7 @@ from mysql_conn import (
 TABLE_SPECS = [
     {"name": "mdl_cohort",                          "pk": "id", "wm": "timemodified"},
     {"name": "mdl_cohort_members",                  "pk": "id", "wm": "timeadded"},
-    {"name": "mdl_context",                         "pk": "id", "wm": None},
+    {"name": "mdl_context",                         "pk": "id", "wm": "id"},
     {"name": "mdl_course",                          "pk": "id", "wm": "timemodified"},
     {"name": "mdl_course_categories",               "pk": "id", "wm": "timemodified"},
     {"name": "mdl_course_completion_crit_compl",    "pk": "id", "wm": "timecompleted"},
