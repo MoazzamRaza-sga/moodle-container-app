@@ -195,7 +195,7 @@ class CSVSink:
 
     # ---------- Path helpers ----------
     def _data_dir_for(self, table: str) -> str:
-        return f"{self.base_path}/{table}/{self.y}/{self.m}/{self.d}"
+        return f"{self.base_path}/{table}/csv/{self.y}/{self.m}/{self.d}"
 
     def _data_relpath_for(self, table: str) -> str:
         return f"{self._data_dir_for(table)}/{table}.csv"
