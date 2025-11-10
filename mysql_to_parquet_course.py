@@ -33,7 +33,6 @@ TABLE_SPECS = [
     {"name": "mdl_course_modules",                  "pk": "id", "wm": "id"},
     {"name": "mdl_course_sections",                 "pk": "id", "wm": "timemodified"},
     {"name": "mdl_videotime",                       "pk": "id", "wm": "id"},
-    {"name": "mdl_logstore_standard_log",           "pk": "id", "wm": "timecreated"},
     {"name": "mdl_certificate_issues",              "pk": "id", "wm": "timecreated"},
     {"name": "mdl_certificate",                     "pk": "id", "wm": "timecreated"}
 ]
