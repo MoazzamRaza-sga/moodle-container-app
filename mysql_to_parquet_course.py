@@ -29,7 +29,13 @@ TABLE_SPECS = [
     {"name": "mdl_tag",                             "pk": "id", "wm": "timemodified"},
     {"name": "mdl_tag_instance",                    "pk": "id", "wm": "timecreated"},
     {"name": "mdl_user_lastaccess",                 "pk": "id", "wm": "timeaccess"},
-    {"name": "mdl_user",                            "pk": "id", "wm": "timemodified"}
+    {"name": "mdl_videotimeplugin_pro_session",     "pk": "id", "wm": "timemodified"},
+    {"name": "mdl_course_modules",                  "pk": "id", "wm": "id"},
+    {"name": "mdl_course_sections",                 "pk": "id", "wm": "timemodified"},
+    {"name": "mdl_videotime",                       "pk": "id", "wm": "id"},
+    {"name": "mdl_logstore_standard_log",           "pk": "id", "wm": "timecreated"},
+    {"name": "mdl_certificate_issues",              "pk": "id", "wm": "timecreated"},
+    {"name": "mdl_certificate",                     "pk": "id", "wm": "timecreated"}
 ]
 
 def _safe_int(x):
